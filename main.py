@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 import ssl
 import time
@@ -21,9 +22,20 @@ from ultralytics import YOLO
 DEFAULT_VEHICLE_CLASSES = (2, 3, 5, 7)
 DEFAULT_SOURCE = "https://cctv-ss02.thb.gov.tw/T2-0K+060"
 DEFAULT_EXPORT_DIR = "exports"
-LINE_TRACKBAR_NAME = "Line Y"
-LINE_START_TRACKBAR_NAME = "Line X1"
-LINE_END_TRACKBAR_NAME = "Line X2"
+DEFAULT_LINE_Y = 300
+DEFAULT_LINE_BAND_HEIGHT = 30
+DEFAULT_LEFT_MARGIN_RATIO = 0.15
+DEFAULT_RIGHT_MARGIN_RATIO = 0.05
+DEFAULT_TOP_MARGIN_RATIO = 0.10
+DEFAULT_FRAME_CROP_LEFT_RATIO = 0.25
+DEFAULT_FRAME_CROP_TOP_RATIO = 0.10
+REGION_SETTINGS_FILE = Path("camera_region_settings.json")
+LINE_TOP_TRACKBAR_NAME = "Line Y1"
+LINE_BOTTOM_TRACKBAR_NAME = "Line Y2"
+LINE_TOP_START_TRACKBAR_NAME = "Top X1"
+LINE_TOP_END_TRACKBAR_NAME = "Top X2"
+LINE_BOTTOM_START_TRACKBAR_NAME = "Bottom X1"
+LINE_BOTTOM_END_TRACKBAR_NAME = "Bottom X2"
 
 
 @dataclass(slots=True)
@@ -31,9 +43,12 @@ class AppConfig:
     source: str | int
     model_path: str
     export_dir: Path
-    line_start_x: int
-    line_end_x: int
+    line_top_start_x: int
+    line_top_end_x: int
     line_y: int
+    line_bottom_start_x: int
+    line_bottom_end_x: int
+    line_y2: int
     window_name: str
     vehicle_classes: tuple[int, ...]
     transport: str
@@ -43,6 +58,104 @@ class AppConfig:
 
 def noop(_: int) -> None:
     return None
+
+
+def load_region_settings() -> dict[str, dict[str, int]]:
+    if not REGION_SETTINGS_FILE.exists():
+        return {}
+
+    try:
+        with REGION_SETTINGS_FILE.open("r", encoding="utf-8") as settings_file:
+            data = json.load(settings_file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    settings: dict[str, dict[str, int]] = {}
+    for source_key, region in data.items():
+        if not isinstance(source_key, str) or not isinstance(region, dict):
+            continue
+        legacy_fields = ("line_start_x", "line_end_x", "line_y1", "line_y2")
+        current_fields = (
+            "line_top_start_x",
+            "line_top_end_x",
+            "line_bottom_start_x",
+            "line_bottom_end_x",
+            "line_y1",
+            "line_y2",
+        )
+        if all(isinstance(region.get(field), int) for field in current_fields):
+            settings[source_key] = {
+                "line_top_start_x": int(region["line_top_start_x"]),
+                "line_top_end_x": int(region["line_top_end_x"]),
+                "line_bottom_start_x": int(region["line_bottom_start_x"]),
+                "line_bottom_end_x": int(region["line_bottom_end_x"]),
+                "line_y1": int(region["line_y1"]),
+                "line_y2": int(region["line_y2"]),
+            }
+        elif all(isinstance(region.get(field), int) for field in legacy_fields):
+            settings[source_key] = {
+                "line_top_start_x": int(region["line_start_x"]),
+                "line_top_end_x": int(region["line_end_x"]),
+                "line_bottom_start_x": int(region["line_start_x"]),
+                "line_bottom_end_x": int(region["line_end_x"]),
+                "line_y1": int(region["line_y1"]),
+                "line_y2": int(region["line_y2"]),
+            }
+    return settings
+
+
+def load_region_setting(source: str | int) -> dict[str, int] | None:
+    return load_region_settings().get(str(source))
+
+
+def save_region_setting(
+    source: str | int,
+    line_top_start_x: int,
+    line_top_end_x: int,
+    line_bottom_start_x: int,
+    line_bottom_end_x: int,
+    line_y1: int,
+    line_y2: int,
+) -> None:
+    settings = load_region_settings()
+    settings[str(source)] = {
+        "line_top_start_x": int(line_top_start_x),
+        "line_top_end_x": int(line_top_end_x),
+        "line_bottom_start_x": int(line_bottom_start_x),
+        "line_bottom_end_x": int(line_bottom_end_x),
+        "line_y1": int(line_y1),
+        "line_y2": int(line_y2),
+    }
+
+    with REGION_SETTINGS_FILE.open("w", encoding="utf-8") as settings_file:
+        json.dump(settings, settings_file, ensure_ascii=True, indent=2, sort_keys=True)
+
+
+def get_default_line_x_bounds(frame_width: int) -> tuple[int, int]:
+    max_x = max(1, frame_width - 1)
+    line_start_x = max(0, min(max_x, int(frame_width * DEFAULT_LEFT_MARGIN_RATIO)))
+    line_end_x = max(line_start_x, min(max_x, int(frame_width * (1.0 - DEFAULT_RIGHT_MARGIN_RATIO))))
+    return line_start_x, line_end_x
+
+
+def get_default_line_y_bounds(frame_height: int, band_height: int) -> tuple[int, int]:
+    max_y = max(1, frame_height - 1)
+    line_y1 = max(0, min(max_y, int(frame_height * DEFAULT_TOP_MARGIN_RATIO)))
+    line_y2 = min(max_y, line_y1 + max(1, band_height))
+    return line_y1, max(line_y1, line_y2)
+
+
+def crop_frame(frame: np.ndarray) -> np.ndarray:
+    frame_height, frame_width = frame.shape[:2]
+    crop_left = min(frame_width - 1, max(0, int(frame_width * DEFAULT_FRAME_CROP_LEFT_RATIO)))
+    crop_top = min(frame_height - 1, max(0, int(frame_height * DEFAULT_FRAME_CROP_TOP_RATIO)))
+    cropped = frame[crop_top:, crop_left:]
+    if cropped.size == 0:
+        return frame
+    return cropped
 
 
 class HourlyCsvExporter:
@@ -140,19 +253,37 @@ def parse_args() -> AppConfig:
         "--line-start-x",
         type=int,
         default=0,
-        help="Starting X coordinate of the counting line segment.",
+        help="Starting X coordinate of the first counting line segment.",
     )
     parser.add_argument(
         "--line-end-x",
         type=int,
         default=1920,
-        help="Ending X coordinate of the counting line segment.",
+        help="Ending X coordinate of the first counting line segment.",
+    )
+    parser.add_argument(
+        "--line2-start-x",
+        type=int,
+        default=None,
+        help="Starting X coordinate of the second counting line segment. Defaults to --line-start-x.",
+    )
+    parser.add_argument(
+        "--line2-end-x",
+        type=int,
+        default=None,
+        help="Ending X coordinate of the second counting line segment. Defaults to --line-end-x.",
     )
     parser.add_argument(
         "--line-y",
         type=int,
-        default=300,
-        help="Y coordinate of the counting line.",
+        default=DEFAULT_LINE_Y,
+        help="Y coordinate of the first counting line.",
+    )
+    parser.add_argument(
+        "--line-y2",
+        type=int,
+        default=None,
+        help=f"Y coordinate of the second counting line. Defaults to --line-y + {DEFAULT_LINE_BAND_HEIGHT}.",
     )
     parser.add_argument(
         "--window-name",
@@ -190,9 +321,12 @@ def parse_args() -> AppConfig:
         source=normalize_source(args.source),
         model_path=args.model,
         export_dir=Path(args.export_dir),
-        line_start_x=args.line_start_x,
-        line_end_x=args.line_end_x,
+        line_top_start_x=args.line_start_x,
+        line_top_end_x=args.line_end_x,
         line_y=args.line_y,
+        line_bottom_start_x=args.line2_start_x if args.line2_start_x is not None else args.line_start_x,
+        line_bottom_end_x=args.line2_end_x if args.line2_end_x is not None else args.line_end_x,
+        line_y2=args.line_y2 if args.line_y2 is not None else args.line_y + DEFAULT_LINE_BAND_HEIGHT,
         window_name=args.window_name,
         vehicle_classes=tuple(args.classes),
         transport=args.transport,
@@ -505,68 +639,202 @@ def fetch_snapshot_frame(snapshot_url: str) -> np.ndarray:
     return frame
 
 
+def apply_gamma(frame: np.ndarray, gamma: float) -> np.ndarray:
+    lookup = np.array([((index / 255.0) ** gamma) * 255 for index in range(256)], dtype=np.uint8)
+    return cv2.LUT(frame, lookup)
+
+
+def enhance_low_light_frame(frame: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    brightness = float(hsv[:, :, 2].mean())
+    if brightness >= 90:
+        return frame
+
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    hsv[:, :, 2] = clahe.apply(hsv[:, :, 2])
+    enhanced = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+    gamma = 0.75 if brightness < 55 else 0.85
+    return apply_gamma(enhanced, gamma)
+
+
+def build_untracked_detection_key(
+    cls: int, center_x: int, center_y: int, width: int, height: int
+) -> tuple[int, int, int, int, int]:
+    return (
+        cls,
+        center_x // 20,
+        center_y // 20,
+        max(1, width // 20),
+        max(1, height // 20),
+    )
+
+
+def is_recent_count_match(
+    recent_event: tuple[int, int, int, int, int, int],
+    cls: int,
+    center_x: int,
+    center_y: int,
+    width: int,
+    height: int,
+    frame_count: int,
+) -> bool:
+    recent_cls, recent_center_x, recent_center_y, recent_width, recent_height, recent_frame = recent_event
+    if recent_cls != cls:
+        return False
+    if frame_count - recent_frame > 90:
+        return False
+
+    distance_threshold = max(40, min(max(width, height), 120))
+    if abs(center_x - recent_center_x) > distance_threshold:
+        return False
+    if abs(center_y - recent_center_y) > distance_threshold:
+        return False
+
+    width_ratio = width / max(1, recent_width)
+    height_ratio = height / max(1, recent_height)
+    return 0.5 <= width_ratio <= 2.0 and 0.5 <= height_ratio <= 2.0
+
+
 def count_vehicles(config: AppConfig) -> None:
+    # model = YOLO(config.model_path)
     model = YOLO(config.model_path)
+    model.to("cuda")       # 強制用GPU
+    model.fuse()           # 加速
+    model.model.half()     # FP16（超重要）
     capture = create_capture(config)
     exporter = HourlyCsvExporter(config.export_dir, config.source)
     counted_ids: set[int] = set()
-    previous_center_y: dict[int, int] = {}
+    counted_untracked: dict[tuple[int, int, int, int, int], int] = {}
+    recent_counted_events: list[tuple[int, int, int, int, int, int]] = []
     count = 0
     last_export_path: Path | None = None
-    line_start_x = config.line_start_x
-    line_end_x = config.line_end_x
-    line_y = config.line_y
+    line_top_start_x = config.line_top_start_x
+    line_top_end_x = config.line_top_end_x
+    line_bottom_start_x = config.line_bottom_start_x
+    line_bottom_end_x = config.line_bottom_end_x
+    line_y1, line_y2 = sorted((config.line_y, config.line_y2))
+    saved_region = load_region_setting(config.source)
     ui_initialized = False
-
+    frame_count = 0
+    last_results = None
     try:
         while True:
             success, frame = capture.read()
             if not success:
                 break
 
+            frame = crop_frame(frame)
+            frame = cv2.resize(frame, (416, 416))  # 降解析度（超重要）
+            frame = enhance_low_light_frame(frame)
+
+            # # ROI（只抓下半部道路）
+            # h = frame.shape[0]
+            # frame = frame[int(h * 0.4) : h, :]
+            frame_count += 1
+
             if not ui_initialized:
                 max_x = max(1, frame.shape[1] - 1)
-                line_y = max(0, min(line_y, frame.shape[0] - 1))
-                line_start_x = max(0, min(line_start_x, max_x))
-                line_end_x = max(0, min(line_end_x, max_x))
-                line_start_x, line_end_x = sorted((line_start_x, line_end_x))
+                max_y = max(1, frame.shape[0] - 1)
+                if saved_region is not None:
+                    line_top_start_x = saved_region["line_top_start_x"]
+                    line_top_end_x = saved_region["line_top_end_x"]
+                    line_bottom_start_x = saved_region["line_bottom_start_x"]
+                    line_bottom_end_x = saved_region["line_bottom_end_x"]
+                    line_y1, line_y2 = sorted((saved_region["line_y1"], saved_region["line_y2"]))
+                elif line_top_start_x == 0 and line_top_end_x == 1920:
+                    line_top_start_x, line_top_end_x = get_default_line_x_bounds(frame.shape[1])
+                    line_bottom_start_x, line_bottom_end_x = line_top_start_x, line_top_end_x
+                    if config.line_y == DEFAULT_LINE_Y and config.line_y2 == DEFAULT_LINE_Y + DEFAULT_LINE_BAND_HEIGHT:
+                        line_y1, line_y2 = get_default_line_y_bounds(
+                            frame.shape[0],
+                            DEFAULT_LINE_BAND_HEIGHT,
+                        )
+                line_y1 = max(0, min(line_y1, max_y))
+                line_y2 = max(0, min(line_y2, max_y))
+                line_y1, line_y2 = sorted((line_y1, line_y2))
+                line_top_start_x = max(0, min(line_top_start_x, max_x))
+                line_top_end_x = max(0, min(line_top_end_x, max_x))
+                line_bottom_start_x = max(0, min(line_bottom_start_x, max_x))
+                line_bottom_end_x = max(0, min(line_bottom_end_x, max_x))
+                line_top_start_x, line_top_end_x = sorted((line_top_start_x, line_top_end_x))
+                line_bottom_start_x, line_bottom_end_x = sorted((line_bottom_start_x, line_bottom_end_x))
                 cv2.namedWindow(config.window_name, cv2.WINDOW_NORMAL)
                 cv2.createTrackbar(
-                    LINE_TRACKBAR_NAME,
+                    LINE_TOP_TRACKBAR_NAME,
                     config.window_name,
-                    line_y,
-                    max(1, frame.shape[0] - 1),
+                    line_y1,
+                    max_y,
                     noop,
                 )
                 cv2.createTrackbar(
-                    LINE_START_TRACKBAR_NAME,
+                    LINE_BOTTOM_TRACKBAR_NAME,
                     config.window_name,
-                    line_start_x,
+                    line_y2,
+                    max_y,
+                    noop,
+                )
+                cv2.createTrackbar(
+                    LINE_TOP_START_TRACKBAR_NAME,
+                    config.window_name,
+                    line_top_start_x,
                     max_x,
                     noop,
                 )
                 cv2.createTrackbar(
-                    LINE_END_TRACKBAR_NAME,
+                    LINE_TOP_END_TRACKBAR_NAME,
                     config.window_name,
-                    line_end_x,
+                    line_top_end_x,
+                    max_x,
+                    noop,
+                )
+                cv2.createTrackbar(
+                    LINE_BOTTOM_START_TRACKBAR_NAME,
+                    config.window_name,
+                    line_bottom_start_x,
+                    max_x,
+                    noop,
+                )
+                cv2.createTrackbar(
+                    LINE_BOTTOM_END_TRACKBAR_NAME,
+                    config.window_name,
+                    line_bottom_end_x,
                     max_x,
                     noop,
                 )
                 ui_initialized = True
 
-            line_y = cv2.getTrackbarPos(LINE_TRACKBAR_NAME, config.window_name)
-            line_start_x = cv2.getTrackbarPos(LINE_START_TRACKBAR_NAME, config.window_name)
-            line_end_x = cv2.getTrackbarPos(LINE_END_TRACKBAR_NAME, config.window_name)
-            line_start_x, line_end_x = sorted((line_start_x, line_end_x))
-
-            results = model.track(
-                frame,
-                persist=True,
-                classes=list(config.vehicle_classes),
-                verbose=False,
+            line_y1 = cv2.getTrackbarPos(LINE_TOP_TRACKBAR_NAME, config.window_name)
+            line_y2 = cv2.getTrackbarPos(LINE_BOTTOM_TRACKBAR_NAME, config.window_name)
+            line_y1, line_y2 = sorted((line_y1, line_y2))
+            line_top_start_x = cv2.getTrackbarPos(LINE_TOP_START_TRACKBAR_NAME, config.window_name)
+            line_top_end_x = cv2.getTrackbarPos(LINE_TOP_END_TRACKBAR_NAME, config.window_name)
+            line_bottom_start_x = cv2.getTrackbarPos(LINE_BOTTOM_START_TRACKBAR_NAME, config.window_name)
+            line_bottom_end_x = cv2.getTrackbarPos(LINE_BOTTOM_END_TRACKBAR_NAME, config.window_name)
+            line_top_start_x, line_top_end_x = sorted((line_top_start_x, line_top_end_x))
+            line_bottom_start_x, line_bottom_end_x = sorted((line_bottom_start_x, line_bottom_end_x))
+            counting_band = build_counting_band_polygon(
+                line_top_start_x,
+                line_top_end_x,
+                line_y1,
+                line_bottom_start_x,
+                line_bottom_end_x,
+                line_y2,
             )
 
-            active_ids: set[int] = set()
+            if frame_count % 5 == 0:
+                results = model.track(
+                    frame,
+                    persist=True,
+                    classes=list(config.vehicle_classes),
+                    verbose=False,
+                    device=0,
+                    imgsz=416,
+                    half=True,
+                )
+                last_results = results
+            else:
+                results = last_results if last_results is not None else []
 
             for result in results:
                 boxes = result.boxes
@@ -575,37 +843,87 @@ def count_vehicles(config: AppConfig) -> None:
                     track_id = get_track_id(box)
                     cls = int(box.cls[0])
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    box_width = max(1, x2 - x1)
+                    box_height = max(1, y2 - y1)
                     center_x = (x1 + x2) // 2
                     center_y = (y1 + y2) // 2
-
-                    if track_id is not None:
-                        active_ids.add(track_id)
-                        previous_y = previous_center_y.get(track_id)
-                        crossed_line = (
-                            line_start_x <= center_x <= line_end_x
-                            and previous_y is not None
-                            and previous_y <= line_y < center_y
-                            and track_id not in counted_ids
+                    inside_region = point_in_polygon((center_x, center_y), counting_band)
+                    matches_recent_count = any(
+                        is_recent_count_match(
+                            recent_event,
+                            cls,
+                            center_x,
+                            center_y,
+                            box_width,
+                            box_height,
+                            frame_count,
                         )
-                        if crossed_line:
+                        for recent_event in recent_counted_events
+                    )
+
+                    if (
+                        inside_region
+                        and not matches_recent_count
+                        and track_id is not None
+                        and track_id not in counted_ids
+                    ):
+                        count += 1
+                        counted_ids.add(track_id)
+                        recent_counted_events.append(
+                            (cls, center_x, center_y, box_width, box_height, frame_count)
+                        )
+                        last_export_path = exporter.write_event(
+                            timestamp=datetime.now(),
+                            count=count,
+                            track_id=track_id,
+                            cls=cls,
+                            center_x=center_x,
+                            center_y=center_y,
+                            line_start_x=line_top_start_x,
+                            line_end_x=line_top_end_x,
+                            line_y=(line_y1 + line_y2) // 2,
+                            x1=x1,
+                            y1=y1,
+                            x2=x2,
+                            y2=y2,
+                        )
+                    elif inside_region and not matches_recent_count and track_id is None:
+                        detection_key = build_untracked_detection_key(
+                            cls, center_x, center_y, box_width, box_height
+                        )
+                        last_counted_frame = counted_untracked.get(detection_key)
+                        if last_counted_frame is None or frame_count - last_counted_frame > 30:
                             count += 1
-                            counted_ids.add(track_id)
+                            counted_untracked[detection_key] = frame_count
+                            recent_counted_events.append(
+                                (cls, center_x, center_y, box_width, box_height, frame_count)
+                            )
                             last_export_path = exporter.write_event(
                                 timestamp=datetime.now(),
                                 count=count,
-                                track_id=track_id,
+                                track_id=-1,
                                 cls=cls,
                                 center_x=center_x,
                                 center_y=center_y,
-                                line_start_x=line_start_x,
-                                line_end_x=line_end_x,
-                                line_y=line_y,
+                                line_start_x=line_top_start_x,
+                                line_end_x=line_top_end_x,
+                                line_y=(line_y1 + line_y2) // 2,
                                 x1=x1,
                                 y1=y1,
                                 x2=x2,
                                 y2=y2,
                             )
-                        previous_center_y[track_id] = center_y
+
+                    counted_untracked = {
+                        key: last_seen_frame
+                        for key, last_seen_frame in counted_untracked.items()
+                        if frame_count - last_seen_frame <= 120
+                    }
+                    recent_counted_events = [
+                        recent_event
+                        for recent_event in recent_counted_events
+                        if frame_count - recent_event[5] <= 120
+                    ]
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.circle(frame, (center_x, center_y), 4, (255, 255, 0), -1)
@@ -620,25 +938,41 @@ def count_vehicles(config: AppConfig) -> None:
                         2,
                     )
 
-            previous_center_y = {
-                track_id: previous_center_y[track_id]
-                for track_id in active_ids
-                if track_id in previous_center_y
-            }
-
-            draw_overlay(frame, line_start_x, line_end_x, line_y, count)
+            draw_overlay(
+                frame,
+                line_top_start_x,
+                line_top_end_x,
+                line_y1,
+                line_bottom_start_x,
+                line_bottom_end_x,
+                line_y2,
+                count,
+            )
             cv2.imshow(config.window_name, frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == 27:
                 break
             if key in (ord("w"), ord("W")):
-                line_y = max(0, line_y - 5)
-                cv2.setTrackbarPos(LINE_TRACKBAR_NAME, config.window_name, line_y)
+                line_y1, line_y2 = shift_counting_band(line_y1, line_y2, -5, frame.shape[0] - 1)
+                cv2.setTrackbarPos(LINE_TOP_TRACKBAR_NAME, config.window_name, line_y1)
+                cv2.setTrackbarPos(LINE_BOTTOM_TRACKBAR_NAME, config.window_name, line_y2)
             if key in (ord("s"), ord("S")):
-                line_y = min(frame.shape[0] - 1, line_y + 5)
-                cv2.setTrackbarPos(LINE_TRACKBAR_NAME, config.window_name, line_y)
+                line_y1, line_y2 = shift_counting_band(line_y1, line_y2, 5, frame.shape[0] - 1)
+                cv2.setTrackbarPos(LINE_TOP_TRACKBAR_NAME, config.window_name, line_y1)
+                cv2.setTrackbarPos(LINE_BOTTOM_TRACKBAR_NAME, config.window_name, line_y2)
     finally:
+        if ui_initialized:
+            with suppress(Exception):
+                save_region_setting(
+                    config.source,
+                    line_top_start_x,
+                    line_top_end_x,
+                    line_bottom_start_x,
+                    line_bottom_end_x,
+                    line_y1,
+                    line_y2,
+                )
         with suppress(Exception):
             capture.release()
         cv2.destroyAllWindows()
@@ -662,8 +996,58 @@ def format_label(box, track_id: int | None) -> str:
     return " | ".join(parts)
 
 
-def draw_overlay(frame, line_start_x: int, line_end_x: int, line_y: int, count: int) -> None:
-    cv2.line(frame, (line_start_x, line_y), (line_end_x, line_y), (0, 0, 255), 2)
+def build_counting_band_polygon(
+    line_top_start_x: int,
+    line_top_end_x: int,
+    line_y1: int,
+    line_bottom_start_x: int,
+    line_bottom_end_x: int,
+    line_y2: int,
+) -> np.ndarray:
+    return np.array(
+        [
+            (line_top_start_x, line_y1),
+            (line_top_end_x, line_y1),
+            (line_bottom_end_x, line_y2),
+            (line_bottom_start_x, line_y2),
+        ],
+        dtype=np.int32,
+    )
+
+
+def point_in_polygon(point: tuple[int, int], polygon: np.ndarray) -> bool:
+    return cv2.pointPolygonTest(polygon.astype(np.float32), point, False) >= 0
+
+
+def shift_counting_band(line_y1: int, line_y2: int, delta: int, max_y: int) -> tuple[int, int]:
+    band_height = line_y2 - line_y1
+    new_line_y1 = max(0, min(line_y1 + delta, max_y - band_height))
+    return new_line_y1, new_line_y1 + band_height
+
+
+def draw_overlay(
+    frame,
+    line_top_start_x: int,
+    line_top_end_x: int,
+    line_y1: int,
+    line_bottom_start_x: int,
+    line_bottom_end_x: int,
+    line_y2: int,
+    count: int,
+) -> None:
+    overlay = frame.copy()
+    band_polygon = build_counting_band_polygon(
+        line_top_start_x,
+        line_top_end_x,
+        line_y1,
+        line_bottom_start_x,
+        line_bottom_end_x,
+        line_y2,
+    )
+    cv2.fillConvexPoly(overlay, band_polygon, (0, 64, 255))
+    cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
+    cv2.line(frame, (line_top_start_x, line_y1), (line_top_end_x, line_y1), (0, 0, 255), 2)
+    cv2.line(frame, (line_bottom_start_x, line_y2), (line_bottom_end_x, line_y2), (0, 165, 255), 2)
     cv2.putText(
         frame,
         f"Count: {count}",
@@ -675,7 +1059,7 @@ def draw_overlay(frame, line_start_x: int, line_end_x: int, line_y: int, count: 
     )
     cv2.putText(
         frame,
-        f"Line Y: {line_y}",
+        f"Band Y: {line_y1} -> {line_y2}",
         (30, 90),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.8,
@@ -684,7 +1068,7 @@ def draw_overlay(frame, line_start_x: int, line_end_x: int, line_y: int, count: 
     )
     cv2.putText(
         frame,
-        f"Line X: {line_start_x} -> {line_end_x}",
+        f"Top X: {line_top_start_x} -> {line_top_end_x}",
         (30, 125),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.6,
@@ -693,8 +1077,17 @@ def draw_overlay(frame, line_start_x: int, line_end_x: int, line_y: int, count: 
     )
     cv2.putText(
         frame,
-        "Adjust Line Y / X1 / X2 sliders or press W/S, ESC to exit",
+        f"Bottom X: {line_bottom_start_x} -> {line_bottom_end_x}",
         (30, 155),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2,
+    )
+    cv2.putText(
+        frame,
+        "Adjust Y1 / Y2 / Top X / Bottom X sliders or press W/S to move band, ESC to exit",
+        (30, 185),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.6,
         (255, 255, 255),
