@@ -18,6 +18,7 @@ It also supports camera web pages that expose a periodically refreshed snapshot 
 - 支援即時預覽畫面，可看到偵測框、車輛中心點、計數線段與目前統計數字
 - 可在執行中調整短線段位置，只統計某一小段道路
 - 支援 MJPEG 串流斷線重連，適合會週期性中斷的監視器來源
+- 支援每小時自動匯出一個 CSV，記錄每次越線事件
 - 關閉視窗時會輸出最終統計數量
 
 ## 示意圖
@@ -45,6 +46,32 @@ uv run python main.py --line-start-x 140 --line-end-x 269 --line-y 126
 ```
 
 實際值仍然可以依照當下畫面裁切、鏡頭角度或你要鎖定的車道位置，再用視窗中的 `Line Y`、`Line X1`、`Line X2` 滑桿微調。
+
+## CSV 匯出
+
+- 程式會在每次車輛越線時，將資料寫入當前小時對應的 CSV 檔案
+- 預設輸出資料夾是 `exports`
+- 檔名格式為 `vehicle_counts_YYYYMMDD_HH00.csv`
+- 如果同一小時持續有新事件，會持續附加到同一個檔案
+
+範例：
+
+```text
+exports/vehicle_counts_20260331_1100.csv
+exports/vehicle_counts_20260331_1200.csv
+```
+
+每筆資料包含：
+
+- 越線時間
+- 小時區間
+- 來源影像
+- 累計計數值
+- track ID
+- class ID
+- 車輛中心點
+- 線段位置
+- 偵測框座標
 
 ## Requirements
 
@@ -193,6 +220,7 @@ uv run python main.py --line-start-x 700 --line-end-x 1100 --line-y 320
 - `--line-y`: Y position of the counting line
 - `--classes`: COCO class IDs to count, default is `2 3 5 7`
 - `--transport`: `auto`, `stream`, or `snapshot`. Default is `auto`
+- `--export-dir`: directory for hourly CSV exports, default is `exports`
 - `--window-name`: OpenCV preview window title
 - `--snapshot-interval`: polling interval for HTTP snapshot sources, default is `1.0`
 - `--reconnect-delay`: reconnect delay for dropped MJPEG streams, default is `1.0`
@@ -203,13 +231,14 @@ uv run python main.py --line-start-x 700 --line-end-x 1100 --line-y 320
 - Drag the `Line Y`, `Line X1`, and `Line X2` sliders to move or shorten the counting line while the program is running.
 - You can also press `W` and `S` to move the line up or down.
 - Press `ESC` to close the window.
-- When the window closes, the terminal prints the final count.
+- When the window closes, the terminal prints the final count and the most recent CSV export path.
 
 ## How Counting Works
 
 - The script uses YOLO object tracking to assign IDs to vehicles.
 - A vehicle is counted once when its center point crosses from above the line to below the line.
 - If you shorten the line using `Line X1` and `Line X2`, only vehicles crossing that road segment are counted.
+- Each crossing event is appended to the current hour's CSV file.
 - The final total is printed to the terminal when the window closes.
 
 ## First Run Behavior
@@ -242,6 +271,12 @@ Run with a different model:
 
 ```bash
 uv run python main.py --model yolov8s.pt
+```
+
+Run and write CSV files to a custom folder:
+
+```bash
+uv run python main.py --export-dir data
 ```
 
 ## Troubleshooting

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import re
 import ssl
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -17,6 +20,7 @@ from ultralytics import YOLO
 
 DEFAULT_VEHICLE_CLASSES = (2, 3, 5, 7)
 DEFAULT_SOURCE = "https://cctv-ss02.thb.gov.tw/T2-0K+060"
+DEFAULT_EXPORT_DIR = "exports"
 LINE_TRACKBAR_NAME = "Line Y"
 LINE_START_TRACKBAR_NAME = "Line X1"
 LINE_END_TRACKBAR_NAME = "Line X2"
@@ -26,6 +30,7 @@ LINE_END_TRACKBAR_NAME = "Line X2"
 class AppConfig:
     source: str | int
     model_path: str
+    export_dir: Path
     line_start_x: int
     line_end_x: int
     line_y: int
@@ -38,6 +43,78 @@ class AppConfig:
 
 def noop(_: int) -> None:
     return None
+
+
+class HourlyCsvExporter:
+    def __init__(self, export_dir: Path, source: str | int) -> None:
+        self.export_dir = export_dir
+        self.source = str(source)
+        self.export_dir.mkdir(parents=True, exist_ok=True)
+
+    def write_event(
+        self,
+        *,
+        timestamp: datetime,
+        count: int,
+        track_id: int,
+        cls: int,
+        center_x: int,
+        center_y: int,
+        line_start_x: int,
+        line_end_x: int,
+        line_y: int,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+    ) -> Path:
+        file_path = self.export_dir / f"vehicle_counts_{timestamp.strftime('%Y%m%d_%H00')}.csv"
+        file_exists = file_path.exists()
+
+        with file_path.open("a", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            if not file_exists:
+                writer.writerow(
+                    [
+                        "timestamp",
+                        "hour_bucket",
+                        "source",
+                        "count",
+                        "track_id",
+                        "class_id",
+                        "center_x",
+                        "center_y",
+                        "line_start_x",
+                        "line_end_x",
+                        "line_y",
+                        "x1",
+                        "y1",
+                        "x2",
+                        "y2",
+                    ]
+                )
+
+            writer.writerow(
+                [
+                    timestamp.isoformat(timespec="seconds"),
+                    timestamp.strftime("%Y-%m-%d %H:00:00"),
+                    self.source,
+                    count,
+                    track_id,
+                    cls,
+                    center_x,
+                    center_y,
+                    line_start_x,
+                    line_end_x,
+                    line_y,
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                ]
+            )
+
+        return file_path
 
 
 def parse_args() -> AppConfig:
@@ -53,6 +130,11 @@ def parse_args() -> AppConfig:
         "--model",
         default="yolov8n.pt",
         help="Ultralytics YOLO model path.",
+    )
+    parser.add_argument(
+        "--export-dir",
+        default=DEFAULT_EXPORT_DIR,
+        help="Directory where hourly CSV files are written.",
     )
     parser.add_argument(
         "--line-start-x",
@@ -107,6 +189,7 @@ def parse_args() -> AppConfig:
     return AppConfig(
         source=normalize_source(args.source),
         model_path=args.model,
+        export_dir=Path(args.export_dir),
         line_start_x=args.line_start_x,
         line_end_x=args.line_end_x,
         line_y=args.line_y,
@@ -425,9 +508,11 @@ def fetch_snapshot_frame(snapshot_url: str) -> np.ndarray:
 def count_vehicles(config: AppConfig) -> None:
     model = YOLO(config.model_path)
     capture = create_capture(config)
+    exporter = HourlyCsvExporter(config.export_dir, config.source)
     counted_ids: set[int] = set()
     previous_center_y: dict[int, int] = {}
     count = 0
+    last_export_path: Path | None = None
     line_start_x = config.line_start_x
     line_end_x = config.line_end_x
     line_y = config.line_y
@@ -488,6 +573,7 @@ def count_vehicles(config: AppConfig) -> None:
 
                 for box in boxes:
                     track_id = get_track_id(box)
+                    cls = int(box.cls[0])
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     center_x = (x1 + x2) // 2
                     center_y = (y1 + y2) // 2
@@ -504,6 +590,21 @@ def count_vehicles(config: AppConfig) -> None:
                         if crossed_line:
                             count += 1
                             counted_ids.add(track_id)
+                            last_export_path = exporter.write_event(
+                                timestamp=datetime.now(),
+                                count=count,
+                                track_id=track_id,
+                                cls=cls,
+                                center_x=center_x,
+                                center_y=center_y,
+                                line_start_x=line_start_x,
+                                line_end_x=line_end_x,
+                                line_y=line_y,
+                                x1=x1,
+                                y1=y1,
+                                x2=x2,
+                                y2=y2,
+                            )
                         previous_center_y[track_id] = center_y
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -542,6 +643,10 @@ def count_vehicles(config: AppConfig) -> None:
             capture.release()
         cv2.destroyAllWindows()
         print(f"Final count: {count}")
+        if last_export_path is not None:
+            print(f"CSV export: {last_export_path}")
+        else:
+            print("CSV export: no crossings recorded yet")
 
 
 def get_track_id(box) -> int | None:
